@@ -1,0 +1,11 @@
+# Binaries
+/target/
+**/*.rs.bk
+**/*.dSYM
+Cargo.lock
+
+# IDE settings
+/.vscode/
+/.idea/
+/*.iml
+
