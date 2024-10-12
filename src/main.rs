@@ -1,5 +1,5 @@
 use tokio;
-use pgwire::pg_server::{PgServer, PgConfig};
+use pgwire::pg_server::{PgServer, PgConfig, ServerParameterProvider};
 use std::net::SocketAddr;
 use log::{info, error};
 use env_logger;
@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use pgwire::pg_server::{PgWireConnectionState, PgWireUserAuthenticator, UserAuthCredential, BoxedError};
 use pgwire::api::auth::Password;
 use pgwire::api::query::{SimpleQueryHandler, SimpleQueryResponse};
+use tokio_postgres::{NoTls, Client};
 
+// Struct for handling requests and authentication
 struct TwentyPgHandler;
 
 #[async_trait]
@@ -22,11 +24,12 @@ impl PgWireUserAuthenticator for TwentyPgHandler {
             _ => "",
         };
 
-        // TODO: Verify if the user has opted-in and credentials are valid
-        // For now, allow all connections
+        // Replace this block with actual authentication logic (e.g., check against your system)
         if username == "valid_user" && password == "valid_password" {
+            info!("Authentication successful for user: {}", username);
             Ok(())
         } else {
+            error!("Authentication failed for user: {}", username);
             Err("Authentication failed".into())
         }
     }
@@ -39,8 +42,48 @@ impl SimpleQueryHandler for TwentyPgHandler {
         query: &str,
         _pg_session: &mut PgWireConnectionState,
     ) -> Result<SimpleQueryResponse, BoxedError> {
-        // TODO: Forward the query to the PostgreSQL database
-        Err("Not implemented".into())
+        // Example of connecting to an actual PostgreSQL database
+        let (client, connection) = tokio_postgres::connect(
+            "host=localhost user=postgres password=your_db_password", NoTls,
+        ).await.map_err(|e| {
+            error!("Failed to connect to database: {}", e);
+            "Database connection error"
+        })?;
+
+        // Spawn the connection object to process notifications
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                error!("Connection error: {}", e);
+            }
+        });
+
+        // Example: Execute a basic query
+        let rows = client.simple_query(query).await.map_err(|e| {
+            error!("Failed to execute query: {}", e);
+            "Query execution error"
+        })?;
+
+        let response = SimpleQueryResponse::new(rows);
+        Ok(response)
+    }
+}
+
+#[async_trait]
+impl ServerParameterProvider for TwentyPgHandler {
+    async fn server_parameters(&self) -> Result<Vec<(String, String)>, BoxedError> {
+        Ok(vec![("application_name".to_string(), "TwentyPostgresProxy".to_string())])
+    }
+}
+
+// Whitelisting IP addresses
+fn is_ip_allowed(ip: std::net::IpAddr) -> bool {
+    // Customize this to implement IP whitelisting logic
+    // Example: Only allow localhost for now
+    if ip == std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)) {
+        true
+    } else {
+        error!("IP address {} is not allowed", ip);
+        false
     }
 }
 
@@ -48,14 +91,28 @@ impl SimpleQueryHandler for TwentyPgHandler {
 async fn main() {
     env_logger::init();
 
-    let addr = "127.0.0.1:5433".parse::<SocketAddr>().unwrap();
+    let addr = "0.0.0.0:5433".parse::<SocketAddr>().unwrap();
     let config = PgConfig::new().with_addr(addr);
 
-    let server = PgServer::new(config, TwentyPgHandler, TwentyPgHandler);
+    let authenticator = TwentyPgHandler;
+    let handler = TwentyPgHandler;
+
+    let server = PgServer::new(config, authenticator, handler);
 
     info!("Starting twenty-postgres-proxy on {}", addr);
 
-    if let Err(e) = server.serve().await {
+    // Wrap the server with IP filtering
+    if let Err(e) = server
+        .with_middleware(|client_addr, _| {
+            if is_ip_allowed(client_addr.ip()) {
+                Ok(())
+            } else {
+                Err("IP not allowed".into())
+            }
+        })
+        .serve()
+        .await
+    {
         error!("Server error: {:?}", e);
     }
 }
